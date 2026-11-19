@@ -8,9 +8,11 @@ ENV PYTHONUNBUFFERED=1 \
     SZLIB_PROFILE_DIR=/data/profile \
     SZLIB_VERIFY_PORT=8765
 
-# Playwright 官方推荐方式安装系统依赖
+# Playwright 的 driver 是 node 二进制，依赖 libatomic1；
+# slim 镜像里没有，缺了会在 `playwright install` 阶段 exit 127。
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl ca-certificates \
+ && apt-get install -y --no-install-recommends \
+      curl ca-certificates libatomic1 \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -18,7 +20,7 @@ COPY pyproject.toml ./
 COPY src ./src
 RUN pip install --upgrade pip \
  && pip install . \
- && pip install "playwright>=1.45" \
+ && pip install "playwright==1.65.2" \
  && python -m playwright install --with-deps firefox \
  && rm -rf /var/lib/apt/lists/*
 
