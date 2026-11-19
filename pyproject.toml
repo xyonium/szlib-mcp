@@ -1,0 +1,19 @@
+[project]
+name = "szlib-mcp"
+version = "0.1.0"
+description = "深圳图书馆数字资源检索 MCP（万方 / 知网 / 读秀）"
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.45",
+    "mcp>=1.0",
+]
+
+[project.scripts]
+szlib-mcp = "szlib_mcp.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
