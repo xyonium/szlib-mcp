@@ -123,7 +123,22 @@ async def _search_szlib(query: str, limit: int, session: str) -> dict:
 | 200 + error | 如 `SEARCH_BOX_NOT_FOUND` 视为上游页面漂移 → 进 `errors` 与 `admin_alert`，不吞成 0 命中 |
 | 字段映射 | `items[].title → title`；`items[].year → published_date`；`type`+`context → abstract`（`"[期刊] 某学报, 2023, (4)"`）；`paper_id = "szlib:" + sha1(title|context|year)[:16]`；无 DOI/全文 |
 | 重试参数 | `szlib_session`（默认 `default`）、`szlib_login_token`（一次性，登录后回传） |
-| 测试 | `paper-search/tests/test_szlib.py`（10 例：映射/稳定 id/202 三态/相对 url/长超时/500/200-error/all 模式不触发） |
+| 测试 | `paper-search/tests/test_szlib.py`（17 例：映射/稳定 id/202 三态/相对 url/长超时/500/200-error/all 模式不触发/后端失败保住 login_required/token 超时/坏 items/limit clamp/UserValves 优先） |
 
-部署侧仍需：`szlib-mcp` 容器与 `open-webui` 同网络；`SZLIB_PUBLIC_BASE_URL` 指向用户可访问的
-`https://mcp.example.com/szlib`（否则 202 里只有相对路径，用户点不开）。
+部署侧（2026-11-19 已上线）：
+
+- `szlib-mcp` 容器与 `open-webui` 同网络（容器内实测 `http://szlib-mcp:8765/healthz` → `szlib-mcp ok`）
+- `SZLIB_PUBLIC_BASE_URL=https://mcp.savorcare.com/szlib`（路径已简化为 `/szlib`，202 里的 url 形如
+  `https://mcp.savorcare.com/szlib/verify/<token>`；未配置时是相对路径，客户端会补 host）
+- 已配 `SZLIB_USERNAME/PASSWORD` 时服务端自动登录（`/api/status` 的 `env_credentials=true`），
+  正常检索直接 200、不弹 202；未配凭据时才走一次性网页登录
+
+**联调结果（2026-11-19，open-webui 容器内、真实 szlib-mcp、真实读秀检索）**：
+
+```
+search_papers("城市更新", 3, sources="szlib")
+→ total=3, source_results={"szlib": 3}, errors={}, login_required=null
+→ 城市更新：机遇与挑战 (2024, szlib:db7bf31aa5ec769f)
+→ 城市更新更新什么？ (2024, szlib:3c830ce0539204b1)
+→ 城市更新C建设工程项目设计风险管理研究 (2026, szlib:37814b119a63e311)
+```

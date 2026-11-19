@@ -90,6 +90,9 @@ volumes:
 | `/api/status` | 会话数与环境状态 |
 | `/healthz` | 健康检查 |
 
+> MCP 端点会校验 `Host` 头（防 DNS 重绑定）。默认放行 `public_base_url` 的主机、
+> `szlib-mcp`、`localhost`；换域名或加反代层时用 `SZLIB_ALLOWED_HOSTS` 追加。
+
 `/api/search` 返回 `202 {"status":"AWAITING_LOGIN","url":...}` 时，把 URL 给用户登录后，
 带 `login_token` 再调一次即可。详见 [`docs/paper-search-integration.md`](docs/paper-search-integration.md)。
 

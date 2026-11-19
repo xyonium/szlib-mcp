@@ -207,11 +207,54 @@ async def health() -> dict:
 
 # ---------------- HTTP 应用 ----------------
 
+def _allowed_hosts() -> list[str]:
+    """MCP 的 DNS 重绑定保护会校验 Host。这里把对外域名与容器内名称都放行。
+
+    - mcp.savorcare.com          （经 Traefik）
+    - szlib-mcp / szlib-mcp:8765 （同一 Docker 网络内互调）
+    - localhost / 127.0.0.1      （本机调试）
+    - SZLIB_ALLOWED_HOSTS 追加    （逗号分隔，便于换域名）
+    """
+    from urllib.parse import urlparse
+
+    hosts = ["localhost", "127.0.0.1", "szlib-mcp", "szlib-mcp:8765"]
+    # 本地调试常用带端口形式
+    hosts += [f"localhost:{cfg.verify_port}", f"127.0.0.1:{cfg.verify_port}"]
+    if cfg.public_base_url:
+        netloc = urlparse(cfg.public_base_url).netloc
+        if netloc:
+            hosts.append(netloc)
+    extra = os.environ.get("SZLIB_ALLOWED_HOSTS", "")
+    hosts += [h.strip() for h in extra.split(",") if h.strip()]
+    # 去重保序
+    seen, out = set(), []
+    for h in hosts:
+        if h not in seen:
+            seen.add(h)
+            out.append(h)
+    return out
+
+
 def build_app():
+    from mcp.server.transport_security import TransportSecuritySettings
     from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
     from starlette.routing import Route
 
-    app = server.streamable_http_app()
+    from urllib.parse import urlparse
+
+    origins = []
+    if cfg.public_base_url:
+        p = urlparse(cfg.public_base_url)
+        if p.scheme and p.netloc:
+            origins.append(f"{p.scheme}://{p.netloc}")
+
+    app = server.streamable_http_app(
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=_allowed_hosts(),
+            allowed_origins=origins,
+        )
+    )
 
     async def verify_get(request):
         token = request.path_params["token"]
