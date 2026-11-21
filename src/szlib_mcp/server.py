@@ -121,7 +121,16 @@ async def ensure_session(key: str) -> tuple[Any, dict[str, Any]]:
     else:
         prompt = "请登录深圳图书馆（未配置 SZLIB_USERNAME / SZLIB_PASSWORD）"
 
-    # 预取验证码图片（如果需要）
+    info = await _create_login_gate(sess, prompt)
+    raise AuthRequired(info)
+
+
+async def _create_login_gate(sess, prompt: str, message: str = "") -> dict:
+    """建一个人工登录门，返回 {code,url,token,expires_in,(message)}。
+
+    ensure_session 和 REST api_search 共用：任何"需要人工登录"的路径都必须
+    返回可点击的 url，否则调用方拿到 202 也无从恢复（2026-11 实测）。
+    """
     image = None
     try:
         await sess.page.goto(f"{cfg.portal}/auth/login", timeout=60000,
@@ -131,14 +140,12 @@ async def ensure_session(key: str) -> tuple[Any, dict[str, Any]]:
     except Exception:
         pass
 
-    qr_url = None
-    if image is None:
-        # 拿一次登录页，判断是否需要验证码；不需要则用户只填账号密码
-        pass
-
     p = gate.create("login", prompt, image=image)
-    raise AuthRequired({"code": "AWAITING_LOGIN", "url": gate.url_for(p),
-                        "token": p.token, "expires_in": p.ttl})
+    info = {"code": "AWAITING_LOGIN", "url": gate.url_for(p),
+            "token": p.token, "expires_in": p.ttl}
+    if message:
+        info["message"] = message
+    return info
 
 
 async def _finish_login(key: str, token: str) -> tuple[Any, dict[str, Any]]:
@@ -307,6 +314,18 @@ def build_app():
             return JSONResponse(res)
         except AuthRequired as e:
             info = e.args[0] if e.args and isinstance(e.args[0], dict) else {}
+            if not info:
+                # 会话层/duxiu 抛的是纯文本（如 "会话未登录"）：不能只回
+                # {"status":"AWAITING_LOGIN"}，否则调用方拿不到 url、无从登录。
+                # 补一个人工登录门；建门失败才退回只有 message 的最小响应。
+                msg = str(e.args[0]) if e.args else ""
+                try:
+                    sess, _ = await browsers.get(session)
+                    info = await _create_login_gate(
+                        sess, f"需要手动登录深圳图书馆（{msg}）" if msg else "请手动登录深圳图书馆",
+                        message=msg)
+                except Exception:
+                    info = {"code": "AWAITING_LOGIN", "message": msg}
             payload = dict(info)
             if "token" in payload:
                 payload["login_token"] = payload.pop("token")
