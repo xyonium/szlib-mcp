@@ -21,6 +21,8 @@ import time
 from ..session import AuthRequired
 
 MAX_WAIT = 40
+# 等结果页新标签出现的时间上限（实测 ~1.3s 就出来）
+SWITCH_WAIT = 15
 
 # "期刊 相关约322321篇" / "图书 相关12067篇"
 HEADER_RE = re.compile(r"([\u4e00-\u9fa5]{2,6})\s*相关约?\s*([\d,]+)\s*[篇种册条]")
@@ -119,7 +121,9 @@ async def search(page, portal: str, query: str, limit: int = 20,
         await page.wait_for_url("**/vpn/**", timeout=45000)
     except Exception:
         pass
-    await page.wait_for_timeout(4000)
+    # 不再固定睡 4s：下面 wait_for_selector("#sw") 已经会等到检索框就绪，
+    # 固定睡眠只是白等。留 600ms 让 VPN 注入的脚本先跑起来。
+    await page.wait_for_timeout(600)
 
     if await _is_login_page(page):
         raise AuthRequired("会话未登录")
@@ -130,29 +134,42 @@ async def search(page, portal: str, query: str, limit: int = 20,
         out["error"] = "SEARCH_BOX_NOT_FOUND"
         return out
 
+    before = set(page.context.pages)
     await page.fill("#sw", query)
     await page.click("#searchbutton", timeout=15000)
 
-    # 等结果块出现
+    # 读秀把结果页开在**新标签**里（实测点击后 ~1.3s 出现，~5.6s 渲染出结果块）。
+    # 旧实现一直在原页面上轮询 mpt_content，必然查不到，只能干等到 MAX_WAIT
+    # 结束再切标签——这是单次检索耗时 ~50s 的真正原因，不是上游慢。
+    result_page = None
+    switch_deadline = time.time() + SWITCH_WAIT
+    while time.time() < switch_deadline:
+        await page.wait_for_timeout(400)
+        new_pages = [p for p in page.context.pages if p not in before]
+        if new_pages:
+            result_page = new_pages[-1]
+            break
+    if result_page is None:
+        # 没开新标签：有的入口是原地跳转，仍在当前页等
+        result_page = page
+
     deadline = time.time() + MAX_WAIT
     while time.time() < deadline:
-        await page.wait_for_timeout(2500)
         try:
-            n = await page.eval_on_selector_all("[class*='mpt_content']", "e => e.length")
+            n = await result_page.eval_on_selector_all(
+                "[class*='mpt_content']", "e => e.length")
         except Exception:
             n = 0
         if n > 0:
             break
+        await result_page.wait_for_timeout(600)
 
-    # 结果可能开在新窗口
+    page = result_page
     body = ""
-    for pg in page.context.pages:
-        try:
-            t = await pg.inner_text("body")
-            if len(t) > len(body):
-                body, page = t, pg
-        except Exception:
-            continue
+    try:
+        body = await page.inner_text("body")
+    except Exception:
+        pass
 
     # 总结果数
     m = re.search(r"相关结果\s*([\d,]+)\s*条", body)
