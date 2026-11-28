@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import random
 import time
@@ -99,20 +100,49 @@ async def _do_login(sess, creds: dict[str, str]) -> tuple[bool, str]:
     return False, "登录后未检测到已登录状态"
 
 
+# 登录 single-flight：并发请求同时发现会话失效时，只能有一个去登录。
+# 多个协程同时提交登录表单是最典型的机器人特征（真人只有一个窗口）。
+_login_lock = asyncio.Lock()
+_last_login_ok_at = 0.0
+_LOGIN_OK_GRACE = 30.0   # 刚登录成功 30s 内，其它协程直接复用结果
+
+
 async def ensure_session(key: str) -> tuple[Any, dict[str, Any]]:
     """确保该会话键已登录。返回 (sess, 附加信息)。
 
     需要人工时抛 AuthRequired，其 args[0] 是 dict：
       {"code": "...", "url": "...", "token": "..."}
+
+    并发安全：同会话的登录动作串行化（single-flight），避免并发表单提交。
     """
+    global _last_login_ok_at
     sess = await browsers.get(key)
 
     # 上下文已登录则直接复用
     if sess.logged_in:
         return sess, {}
 
+    # 别人刚登录成功，直接复用（不再重复验证/登录）
+    if time.time() - _last_login_ok_at < _LOGIN_OK_GRACE:
+        sess.logged_in = True
+        return sess, {}
+
+    async with _login_lock:
+        # 双检：等锁期间可能已被别的协程登录
+        if sess.logged_in:
+            return sess, {}
+        if time.time() - _last_login_ok_at < _LOGIN_OK_GRACE:
+            sess.logged_in = True
+            return sess, {}
+        return await _ensure_session_locked(key, sess)
+
+
+async def _ensure_session_locked(key: str, sess) -> tuple[Any, dict[str, Any]]:
+    global _last_login_ok_at
+
     if await _is_logged_in(sess.page, cfg.portal):
         sess.logged_in = True
+        _last_login_ok_at = time.time()
         return sess, {}
 
     # 有 env 凭据 → 直接尝试
@@ -120,6 +150,8 @@ async def ensure_session(key: str) -> tuple[Any, dict[str, Any]]:
         ok, msg = await _do_login(
             sess, {"username": cfg.username, "password": cfg.password})
         if ok:
+            sess.logged_in = True
+            _last_login_ok_at = time.time()
             return sess, {}
         # 失败则走人工
         prompt = f"自动登录未成功（{msg}），请手动登录深圳图书馆"
@@ -170,27 +202,94 @@ async def _finish_login(key: str, token: str) -> tuple[Any, dict[str, Any]]:
 
 # 同一读者账号并发检索是典型爬虫特征（真人一次只搜一个词）。
 # 这里强制排队，队列深度不设上限但等待会在下层超时——宁可慢，不要被封。
+# 同一读者账号并发检索是典型爬虫特征（真人一次只搜一个词）。
+# 串行执行，并且**有界**：无限堆积会让 10 个 agent 排成几分钟的连续请求流，
+# 那本身比"偶尔慢"更像机器。排队上限 3，超过直接拒绝。
 _search_lock = asyncio.Lock()
+_MAX_WAITING = 3
+_MAX_QUEUE_WAIT = 90.0
+_waiting = 0
 _last_search_at = 0.0
+
+# 相同查询短期缓存：多个 agent 问同一个词时不该重复打上游。
+_CACHE_TTL = 900.0          # 15 分钟
+_cache: dict[str, tuple[float, dict]] = {}
+_CACHE_MAX = 128
+
+
+def _cache_key(query: str, limit: int) -> str:
+    return f"{query.strip().lower()}|{limit}"
+
+
+def _cache_get(key: str) -> dict | None:
+    hit = _cache.get(key)
+    if not hit:
+        return None
+    ts, val = hit
+    if time.time() - ts > _CACHE_TTL:
+        _cache.pop(key, None)
+        return None
+    return json.loads(json.dumps(val))      # 防止调用方改到缓存
+
+
+def _cache_put(key: str, val: dict) -> None:
+    if len(_cache) >= _CACHE_MAX:
+        # 丢掉最旧的一半，避免无界增长
+        for k in sorted(_cache, key=lambda k: _cache[k][0])[: _CACHE_MAX // 2]:
+            _cache.pop(k, None)
+    _cache[key] = (time.time(), json.loads(json.dumps(val)))
 
 
 async def _rate_limited_search(sess, query: str, limit: int) -> dict:
-    """串行 + 最小间隔地执行一次读秀检索。"""
-    global _last_search_at
+    """串行 + 限流 + 缓存地执行一次读秀检索。"""
+    global _last_search_at, _waiting
+
+    ck = _cache_key(query, limit)
+    cached = _cache_get(ck)
+    if cached is not None:
+        return cached
+
     if not cfg.serialize_searches:
-        return await duxiu.search(sess.page, cfg.portal, query, limit=limit,
-                                  db_id=cfg.db_ids["duxiu"])
-    async with _search_lock:
-        # 两次检索之间留出人类间隔，避免固定节奏
-        gap = cfg.min_request_interval + random.uniform(0.5, 2.0)
-        wait = gap - (time.time() - _last_search_at)
-        if wait > 0:
-            await asyncio.sleep(wait)
+        res = await duxiu.search(sess.page, cfg.portal, query, limit=limit,
+                                 db_id=cfg.db_ids["duxiu"])
+        if res.get("ok"):
+            _cache_put(ck, res)
+        return res
+
+    # 有界排队：满了立刻拒绝，让调用方退避重试，而不是排进长队
+    queued = False
+    if _search_lock.locked():
+        if _waiting >= _MAX_WAITING:
+            return {"source": "duxiu", "query": query, "ok": False,
+                    "total": None, "by_type": {}, "items": [],
+                    "error": "BUSY: 检索队列已满（1 执行 + 3 等待），请稍后重试"}
+        _waiting += 1
+        queued = True
+    try:
         try:
-            return await duxiu.search(sess.page, cfg.portal, query, limit=limit,
-                                      db_id=cfg.db_ids["duxiu"])
+            await asyncio.wait_for(_search_lock.acquire(), timeout=_MAX_QUEUE_WAIT)
+        except asyncio.TimeoutError:
+            return {"source": "duxiu", "query": query, "ok": False,
+                    "total": None, "by_type": {}, "items": [],
+                    "error": "BUSY: 排队超时（>90s），请稍后重试"}
+        try:
+            # 两次检索之间留出人类间隔，避免固定节奏
+            gap = cfg.min_request_interval + random.uniform(0.5, 2.0)
+            wait = gap - (time.time() - _last_search_at)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            res = await duxiu.search(sess.page, cfg.portal, query, limit=limit,
+                                     db_id=cfg.db_ids["duxiu"])
         finally:
             _last_search_at = time.time()
+            _search_lock.release()
+    finally:
+        if queued:
+            _waiting = max(0, _waiting - 1)
+
+    if res.get("ok"):
+        _cache_put(ck, res)
+    return res
 
 
 async def _warmup_once() -> None:

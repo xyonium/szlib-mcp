@@ -99,6 +99,25 @@ def _split_meta(meta: str, dtype: str) -> tuple[str, str, str]:
     return authors, source, year
 
 
+async def _close_result_tab(result_page, origin_page) -> None:
+    """关掉结果标签页，只留门户页复用。幂等，异常安全。
+
+    必须在 finally 里调用：解析失败、超时、跳转异常等提前返回的路径
+    同样会泄漏标签页（复测前 tabs 只增不减就是这个原因）。
+    """
+    if result_page is None or result_page is origin_page:
+        return
+    try:
+        if not result_page.is_closed():
+            await result_page.close()
+    except Exception:
+        pass
+    try:
+        await origin_page.bring_to_front()
+    except Exception:
+        pass
+
+
 async def _is_login_page(page) -> bool:
     try:
         if "auth" in page.url or "userLogin" in page.url:
@@ -208,6 +227,7 @@ async def search(page, portal: str, query: str, limit: int = 20,
         except Exception as e:
             if attempt == 2:
                 out["error"] = f"PARSE_FAILED: {type(e).__name__}"
+                await _close_result_tab(result_page, origin_page)
                 return out
             blocks = []
 
@@ -265,14 +285,6 @@ async def search(page, portal: str, query: str, limit: int = 20,
     # 关掉本次结果标签页：读秀每次都开新标签，不关会一路涨内存
     # （实测 8 次检索 tabs 2→9、RSS 396→490MB，只增不减）。
     # 保留最初那个门户页，下次检索直接复用它。
-    if result_page is not origin_page:
-        try:
-            await result_page.close()
-        except Exception:
-            pass
-    try:
-        await origin_page.bring_to_front()
-    except Exception:
-        pass
+    await _close_result_tab(result_page, origin_page)
 
     return out
