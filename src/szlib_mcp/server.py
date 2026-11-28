@@ -414,11 +414,6 @@ def build_app():
         )
     )
 
-    if cfg.warmup_on_start:
-        async def _on_startup():
-            # 后台跑，不阻塞端口监听；失败只记日志
-            asyncio.create_task(_warmup_once())
-        app.add_event_handler("startup", _on_startup)
 
     async def verify_get(request):
         token = request.path_params["token"]
@@ -514,6 +509,22 @@ def main() -> None:
     gate.bind_loop(loop)
 
     app = build_app()
+
+    if cfg.warmup_on_start:
+        # 预热是进程级动作，不放 Starlette 钩子（1.x 已移除 on_startup）。
+        # 用后台线程跑独立事件循环：绝不阻塞端口监听，也不与 uvicorn 循环互相干扰。
+        import threading
+
+        def _warm_thread():
+            wl = asyncio.new_event_loop()
+            asyncio.set_event_loop(wl)
+            try:
+                wl.run_until_complete(_warmup_once())
+            finally:
+                wl.close()
+
+        threading.Thread(target=_warm_thread, name="warmup", daemon=True).start()
+
     uvicorn.run(app, host="0.0.0.0", port=cfg.verify_port, log_level="info")
 
 
