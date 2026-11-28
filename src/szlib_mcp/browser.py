@@ -18,7 +18,9 @@ from .config import Config, get_config
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36")
 
-CONTEXT_TTL = 3600      # 会话上下文空闲多久回收（秒）
+# 会话上下文空闲多久回收（秒）。取配置值，保证与 idle_stop_minutes 对齐：
+# 否则 context 先于休眠被回收，登录态丢失，"维护几小时后自然休息"就名存实亡。
+CONTEXT_TTL = 3600
 
 
 @dataclass
@@ -91,7 +93,8 @@ class BrowserManager:
     def _sweep_locked(self) -> None:
         now = time.time()
         for k, s in list(self._sessions.items()):
-            if now - s.last_used > CONTEXT_TTL:
+            ttl = self.cfg.context_ttl_minutes * 60
+            if now - s.last_used > ttl:
                 self._sessions.pop(k, None)
                 try:
                     asyncio.create_task(s.ctx.close())

@@ -71,6 +71,17 @@ class Config:
     keepalive_min_minutes: int = 30
     keepalive_max_minutes: int = 50
 
+    # 会话上下文保留时长。必须 >= idle_stop_minutes，否则"维护几小时后
+    # 自然休息"不成立——context 一关，登录态就丢了，下次要重新登录 ~16s。
+    context_ttl_minutes: int = 240
+
+    # 开机预热：后台启动浏览器 + 登录 + 打开门户页，让第一个真实检索
+    # 不用等这 ~22s。只做一次登录（人类打开网站也是这个频率），不预先检索。
+    warmup_on_start: bool = True
+
+    # 串行化检索：同一账号并发检索是典型爬虫特征，这里强制排队。
+    serialize_searches: bool = True
+
     min_request_interval: float = 3.0
 
     portal: str = "https://er.szlib.org.cn:8899"
@@ -102,6 +113,14 @@ class Config:
             cfg.keepalive_min_minutes = 5
 
         cfg.min_request_interval = float(_env_int("SZLIB_MIN_REQUEST_INTERVAL", 3))
+
+        cfg.context_ttl_minutes = _env_int("SZLIB_CONTEXT_TTL_MINUTES",
+                                           cfg.idle_stop_minutes)
+        if cfg.context_ttl_minutes < cfg.idle_stop_minutes:
+            # context 比休眠还短 = 登录态撑不到"自然休息"，强制对齐
+            cfg.context_ttl_minutes = cfg.idle_stop_minutes
+        cfg.warmup_on_start = _env_bool("SZLIB_WARMUP_ON_START", True)
+        cfg.serialize_searches = _env_bool("SZLIB_SERIALIZE_SEARCHES", True)
 
         cfg.portal = _env_str("SZLIB_PORTAL", cfg.portal).rstrip("/")
         for key, env_name, default in (

@@ -135,6 +135,7 @@ async def search(page, portal: str, query: str, limit: int = 20,
         return out
 
     before = set(page.context.pages)
+    origin_page = page
     await page.fill("#sw", query)
     await page.click("#searchbutton", timeout=15000)
 
@@ -178,33 +179,44 @@ async def search(page, portal: str, query: str, limit: int = 20,
 
     # 按类型块解析题录
     blocks = []
-    try:
-        blocks = await page.evaluate(
-            """() => {
-                const bs = [...document.querySelectorAll("[class*='mpt_content']")];
-                return bs.map(b => {
-                    const nameEl = b.querySelector('.name');
-                    const header = nameEl ? (nameEl.innerText || '').trim() : '';
-                    const items = [];
-                    let cur = null;
-                    for (const c of b.children) {
-                        if (c.tagName === 'A') {
-                            if (cur) items.push(cur);
-                            cur = {title: (c.innerText || '').trim(), meta: ''};
-                        } else if (c.tagName === 'SPAN' && cur) {
-                            cur.meta = (c.innerText || '').replace(/\\s+/g, ' ').trim();
-                            items.push(cur);
-                            cur = null;
+    page = result_page
+    for attempt in (1, 2):
+        try:
+            blocks = await page.evaluate(
+                """() => {
+                    const bs = [...document.querySelectorAll("[class*='mpt_content']")];
+                    return bs.map(b => {
+                        const nameEl = b.querySelector('.name');
+                        const header = nameEl ? (nameEl.innerText || '').trim() : '';
+                        const items = [];
+                        let cur = null;
+                        for (const c of b.children) {
+                            if (c.tagName === 'A') {
+                                if (cur) items.push(cur);
+                                cur = {title: (c.innerText || '').trim(), meta: ''};
+                            } else if (c.tagName === 'SPAN' && cur) {
+                                cur.meta = (c.innerText || '').replace(/\\s+/g, ' ').trim();
+                                items.push(cur);
+                                cur = null;
+                            }
                         }
-                    }
-                    if (cur) items.push(cur);
-                    return {header, items};
-                });
-            }"""
-        )
-    except Exception as e:
-        out["error"] = f"PARSE_FAILED: {type(e).__name__}"
-        return out
+                        if (cur) items.push(cur);
+                        return {header, items};
+                    });
+                }"""
+            )
+        except Exception as e:
+            if attempt == 2:
+                out["error"] = f"PARSE_FAILED: {type(e).__name__}"
+                return out
+            blocks = []
+
+        # 偶发"结果块已渲染但题录还没填充"，再给一次机会（模拟人刷新后重看，
+        # 不是重复提交检索，所以不会增加被封风险）。
+        if blocks and any(b.get("items") for b in blocks):
+            break
+        if attempt == 1:
+            await page.wait_for_timeout(2500)
 
     # 先收集所有块，再按类型优先级排序后截断：
     # 读秀的类型块顺序是随机的（图书/插图/期刊…），直接按 DOM 顺序截断
@@ -249,4 +261,18 @@ async def search(page, portal: str, query: str, limit: int = 20,
 
     out["items"] = parsed
     out["ok"] = bool(parsed) or out["total"] is not None
+
+    # 关掉本次结果标签页：读秀每次都开新标签，不关会一路涨内存
+    # （实测 8 次检索 tabs 2→9、RSS 396→490MB，只增不减）。
+    # 保留最初那个门户页，下次检索直接复用它。
+    if result_page is not origin_page:
+        try:
+            await result_page.close()
+        except Exception:
+            pass
+    try:
+        await origin_page.bring_to_front()
+    except Exception:
+        pass
+
     return out

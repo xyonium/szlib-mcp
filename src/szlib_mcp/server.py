@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import time
 from typing import Any
 
@@ -28,6 +29,10 @@ gate = VerificationGate(public_base_url=cfg.public_base_url, port=cfg.verify_por
 
 def _ts() -> str:
     return time.strftime("%H:%M:%S")
+
+
+def log(msg: str) -> None:
+    print(f"[{_ts()}] {msg}", flush=True)
 
 
 async def _capture_captcha(page) -> bytes | None:
@@ -161,6 +166,55 @@ async def _finish_login(key: str, token: str) -> tuple[Any, dict[str, Any]]:
     return sess, {"username": values.get("username", "")}
 
 
+# ---------------- 检索串行化 / 开机预热 ----------------
+
+# 同一读者账号并发检索是典型爬虫特征（真人一次只搜一个词）。
+# 这里强制排队，队列深度不设上限但等待会在下层超时——宁可慢，不要被封。
+_search_lock = asyncio.Lock()
+_last_search_at = 0.0
+
+
+async def _rate_limited_search(sess, query: str, limit: int) -> dict:
+    """串行 + 最小间隔地执行一次读秀检索。"""
+    global _last_search_at
+    if not cfg.serialize_searches:
+        return await duxiu.search(sess.page, cfg.portal, query, limit=limit,
+                                  db_id=cfg.db_ids["duxiu"])
+    async with _search_lock:
+        # 两次检索之间留出人类间隔，避免固定节奏
+        gap = cfg.min_request_interval + random.uniform(0.5, 2.0)
+        wait = gap - (time.time() - _last_search_at)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        try:
+            return await duxiu.search(sess.page, cfg.portal, query, limit=limit,
+                                      db_id=cfg.db_ids["duxiu"])
+        finally:
+            _last_search_at = time.time()
+
+
+async def _warmup_once() -> None:
+    """开机预热：启动浏览器 + 自动登录 + 打开门户页。
+
+    刻意**不做检索**——登录是人类打开网站就会发生的一次动作，
+    而检索才是频率敏感、最容易被判定为爬虫的行为。
+    失败只记日志，不影响服务启动。
+    """
+    try:
+        sess = await browsers.get("default")
+        if not sess.logged_in:
+            try:
+                await ensure_session("default")
+            except AuthRequired as e:
+                log(f"[warmup] 需要人工登录，跳过: {str(e)[:80]}")
+                return
+        ok = await _is_logged_in(sess.page, cfg.portal)
+        sess.logged_in = bool(ok)
+        log(f"[warmup] 完成 logged_in={ok}")
+    except Exception as e:
+        log(f"[warmup] 失败（不影响服务）: {type(e).__name__}: {str(e)[:80]}")
+
+
 # ---------------- MCP 工具 ----------------
 
 @server.tool()
@@ -175,9 +229,7 @@ async def search_literature(query: str, limit: int = 20,
     if not sess.logged_in:
         await ensure_session(session)
 
-    res = await duxiu.search(sess.page, cfg.portal, query, limit=limit,
-                             db_id=cfg.db_ids["duxiu"])
-    return res
+    return await _rate_limited_search(sess, query, limit)
 
 
 @server.tool()
@@ -263,6 +315,12 @@ def build_app():
         )
     )
 
+    if cfg.warmup_on_start:
+        async def _on_startup():
+            # 后台跑，不阻塞端口监听；失败只记日志
+            asyncio.create_task(_warmup_once())
+        app.add_event_handler("startup", _on_startup)
+
     async def verify_get(request):
         token = request.path_params["token"]
         status, body = gate.render_html(token)
@@ -309,8 +367,7 @@ def build_app():
             if login_token:
                 await _finish_login(session, login_token)
             sess, _ = await ensure_session(session)
-            res = await duxiu.search(sess.page, cfg.portal, query,
-                                     limit=limit, db_id=cfg.db_ids["duxiu"])
+            res = await _rate_limited_search(sess, query, limit)
             return JSONResponse(res)
         except AuthRequired as e:
             info = e.args[0] if e.args and isinstance(e.args[0], dict) else {}
